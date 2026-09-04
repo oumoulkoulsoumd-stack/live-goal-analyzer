@@ -226,3 +226,216 @@ function aiAnalysis(m, pressure) {
 
   return `${m.minute}e minute. ${team} domine actuellement les statistiques offensives (${dominantSot} tirs cadrés contre ${otherSot}${xgLead > 0.15 ? `, avec un avantage d'xG de +${xgLead.toFixed(2)}` : ""}). ${convergencePhrase}${trendUp ? "La pression offensive s'est accentuée au cours des 10 dernières minutes. " : "La dynamique récente reste stable. "}Signal : ${sig.label.toUpperCase()}. Le contexte statistique est favorable à une poursuite de la pression de ${team}, mais ne garantit pas qu'un but sera marqué.`;
    }
+function tickMatch(m) {
+  if (m.finished || m.minute >= 90) return { ...m, finished: true };
+  const next = { ...m };
+  next.minute = m.minute + 1;
+
+  // Chaque équipe a une probabilité d'action liée à son "bias" courant + un peu de hasard
+  const driftedBias = clamp(m.bias + (Math.random() - 0.5) * 0.06, 0.15, 0.85);
+  next.bias = driftedBias;
+
+  const homeActs = Math.random() < 0.55;
+  const actingHomeProb = driftedBias;
+  const homeIsActing = Math.random() < actingHomeProb;
+
+  if (Math.random() < 0.75) { // un tir se produit cette minute
+    if (homeIsActing) {
+      next.shotsHome += 1;
+      if (Math.random() < 0.5) { next.sotHome += 1; next.xgHome = +(next.xgHome + 0.05 + Math.random() * 0.15).toFixed(2); }
+      else next.xgHome = +(next.xgHome + 0.02 + Math.random() * 0.05).toFixed(2);
+    } else {
+      next.shotsAway += 1;
+      if (Math.random() < 0.5) { next.sotAway += 1; next.xgAway = +(next.xgAway + 0.05 + Math.random() * 0.15).toFixed(2); }
+      else next.xgAway = +(next.xgAway + 0.02 + Math.random() * 0.05).toFixed(2);
+    }
+  }
+  if (Math.random() < 0.2) { if (homeIsActing) next.cornersHome += 1; else next.cornersAway += 1; }
+  if (homeIsActing) next.dangerousHome += Math.floor(Math.random() * 3);
+  else next.dangerousAway += Math.floor(Math.random() * 3);
+
+  next.possessionHome = clamp(Math.round(m.possessionHome + (driftedBias - 0.5) * 4 + (Math.random() - 0.5) * 3), 28, 72);
+
+  if (Math.random() < 0.02) next.fouls += 1;
+  if (Math.random() < 0.006) { if (homeIsActing) next.yellow += 1; else next.yellow += 1; }
+  if (Math.random() < 0.001) next.red += 1;
+
+  // Chance de but, influencée par la pression du moment
+  const tempPressure = computePressure(next, DEFAULT_WEIGHTS);
+  const goalChance = Math.pow(tempPressure.score / 100, 3) * 0.05;
+  let goal = null;
+  if (Math.random() < goalChance) {
+    if (tempPressure.dominant === "home") next.scoreHome += 1; else next.scoreAway += 1;
+    goal = tempPressure.dominant;
+  }
+
+  // On conserve tirs cadrés / corners / xG / minute / score à chaque relevé :
+  // c'est exactement l'ensemble de variables à corréler statistiquement plus
+  // tard avec la fréquence de but dans les 5/10/15 minutes suivantes (V2/V3).
+  next.history = [...m.history, {
+    minute: next.minute,
+    homeShare: tempPressure.homeShare,
+    sotHome: next.sotHome, sotAway: next.sotAway,
+    cornersHome: next.cornersHome, cornersAway: next.cornersAway,
+    xgHome: next.xgHome, xgAway: next.xgAway,
+    scoreHome: next.scoreHome, scoreAway: next.scoreAway,
+    convergenceCount: tempPressure.convergence.count,
+    goal,
+  }];
+  return next;
+}
+
+// ---------------- UI atoms ----------------
+
+function StatBar({ label, home, away, homeLabel, awayLabel, format = (x) => x }) {
+  const total = home + away || 1;
+  const homePct = (home / total) * 100;
+  return (
+    <div className="mb-3">
+      <div className="flex justify-between text-xs text-slate-400 mb-1 font-mono">
+        <span>{format(home)}</span>
+        <span className="text-slate-500">{label}</span>
+        <span>{format(away)}</span>
+      </div>
+      <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden flex">
+        <div className="h-full bg-sky-500" style={{ width: `${homePct}%` }} />
+        <div className="h-full bg-orange-500" style={{ width: `${100 - homePct}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function SignalBadge({ score }) {
+  const sig = signalLevel(score);
+  const t = TONE_STYLES[sig.tone];
+  return (
+    <span className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full border ${t.badge}`}>
+      {sig.emoji} {sig.label}
+    </span>
+  );
+}
+
+function PressureBar({ score }) {
+  const sig = signalLevel(score);
+  const t = TONE_STYLES[sig.tone];
+  return (
+    <div>
+      <div className="flex justify-between text-xs text-slate-400 mb-1">
+        <span>Pression offensive</span>
+        <span className="font-mono text-slate-200">{score}/100</span>
+      </div>
+      <div className="h-2 w-full bg-slate-800 rounded-full overflow-hidden">
+        <div className={`h-full ${t.bar} transition-all duration-500`} style={{ width: `${score}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function MatchCard({ m, pressure, onOpen }) {
+  const team = pressure.dominant === "home" ? m.home : m.away;
+  return (
+    <button onClick={() => onOpen(m.id)} className="text-left w-full bg-slate-900 border border-slate-800 rounded-2xl p-4 hover:border-slate-600 transition-colors">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[11px] text-slate-500">{m.competition}</span>
+        <span className="text-[11px] font-mono text-red-400 flex items-center gap-1">● {m.minute}'</span>
+      </div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="font-semibold text-slate-100 text-sm leading-tight">{m.home}<br />{m.away}</div>
+        <div className="font-mono text-2xl font-bold text-slate-100">{m.scoreHome} - {m.scoreAway}</div>
+      </div>
+      <div className="grid grid-cols-2 gap-x-4 text-xs text-slate-400 font-mono mb-3">
+        <div>🎯 SOT&nbsp; {m.sotHome} - {m.sotAway}</div>
+        <div>xG&nbsp;&nbsp;&nbsp; {m.xgHome.toFixed(2)} - {m.xgAway.toFixed(2)}</div>
+        <div>Corners {m.cornersHome} - {m.cornersAway}</div>
+        <div>Poss. {m.possessionHome}% - {100 - m.possessionHome}%</div>
+      </div>
+      <PressureBar score={pressure.score} />
+      <div className="mt-2 flex items-center justify-between">
+        <span className="text-xs text-slate-500">Équipe dominante : <span className="text-slate-300">{team}</span></span>
+        <SignalBadge score={pressure.score} />
+      </div>
+      {pressure.missingLabels.length > 0 && (
+        <div className="mt-2 text-[10px] text-amber-400/80">⚠️ Indisponible : {pressure.missingLabels.join(", ")}</div>
+      )}
+    </button>
+  );
+}
+
+function Dashboard({ matches, pressures, filters, setFilters, weights, onOpen }) {
+  const filtered = matches.filter((m) => {
+    const p = pressures[m.id];
+    if (filters.half === "1" && m.minute > 45) return false;
+    if (filters.half === "2" && m.minute <= 45) return false;
+    if (filters.minuteBand === "45-60" && !(m.minute >= 45 && m.minute <= 60)) return false;
+    if (filters.minuteBand === "60-75" && !(m.minute > 60 && m.minute <= 75)) return false;
+    if (filters.minuteBand === "75-90" && !(m.minute > 75 && m.minute <= 90)) return false;
+    if (filters.draw && m.scoreHome !== m.scoreAway) return false;
+    if (filters.oneGoalGap && Math.abs(m.scoreHome - m.scoreAway) !== 1) return false;
+    if (filters.highPressure && p.score < 75) return false;
+    const sot = Math.max(m.sotHome, m.sotAway);
+    if (sot < filters.minSot) return false;
+    return true;
+  });
+
+  const liveCount = matches.length;
+  const highPressureCount = matches.filter((m) => pressures[m.id].score >= 75).length;
+  const goalsRecent = matches.reduce((acc, m) => acc + m.history.filter(h => h.goal && h.minute > m.minute - 10).length, 0);
+  const activeSignals = matches.filter((m) => pressures[m.id].score >= 60).length;
+
+  return (
+    <div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        <SummaryTile emoji="🔴" label="Matchs LIVE" value={liveCount} />
+        <SummaryTile emoji="🔥" label="Forte pression" value={highPressureCount} />
+        <SummaryTile emoji="⚽" label="Buts récents (10')" value={goalsRecent} />
+        <SummaryTile emoji="📊" label="Signaux actifs" value={activeSignals} />
+      </div>
+
+      <FilterBar filters={filters} setFilters={setFilters} />
+
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-4">
+        {filtered.map((m) => (
+          <MatchCard key={m.id} m={m} pressure={pressures[m.id]} onOpen={onOpen} />
+        ))}
+        {filtered.length === 0 && (
+          <div className="col-span-full text-center text-slate-500 py-12 text-sm">Aucun match ne correspond à ces filtres.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SummaryTile({ emoji, label, value }) {
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+      <div className="text-2xl mb-1">{emoji}</div>
+      <div className="text-2xl font-bold font-mono text-slate-100">{value}</div>
+      <div className="text-xs text-slate-500">{label}</div>
+    </div>
+  );
+}
+
+function FilterBar({ filters, setFilters }) {
+  const set = (k, v) => setFilters((f) => ({ ...f, [k]: v }));
+  const chip = (active) => `text-xs px-3 py-1.5 rounded-full border transition-colors ${active ? "bg-orange-500/15 border-orange-500/40 text-orange-300" : "bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-600"}`;
+  return (
+    <div className="flex flex-wrap gap-2 items-center">
+      <button className={chip(filters.half === "all")} onClick={() => set("half", "all")}>Tous</button>
+      <button className={chip(filters.half === "1")} onClick={() => set("half", "1")}>1re mi-temps</button>
+      <button className={chip(filters.half === "2")} onClick={() => set("half", "2")}>2e mi-temps</button>
+      <button className={chip(filters.minuteBand === "45-60")} onClick={() => set("minuteBand", filters.minuteBand === "45-60" ? "all" : "45-60")}>45–60'</button>
+      <button className={chip(filters.minuteBand === "60-75")} onClick={() => set("minuteBand", filters.minuteBand === "60-75" ? "all" : "60-75")}>60–75'</button>
+      <button className={chip(filters.minuteBand === "75-90")} onClick={() => set("minuteBand", filters.minuteBand === "75-90" ? "all" : "75-90")}>75–90'</button>
+      <button className={chip(filters.draw)} onClick={() => set("draw", !filters.draw)}>Score nul</button>
+      <button className={chip(filters.oneGoalGap)} onClick={() => set("oneGoalGap", !filters.oneGoalGap)}>Écart d'1 but</button>
+      <button className={chip(filters.highPressure)} onClick={() => set("highPressure", !filters.highPressure)}>Forte pression</button>
+      <select value={filters.minSot} onChange={(e) => set("minSot", Number(e.target.value))} className="text-xs bg-slate-900 border border-slate-800 rounded-full px-3 py-1.5 text-slate-300">
+        <option value={0}>Tirs cadrés ≥ 0</option>
+        <option value={3}>≥ 3</option>
+        <option value={5}>≥ 5</option>
+        <option value={7}>≥ 7</option>
+        <option value={10}>≥ 10</option>
+      </select>
+    </div>
+  );
+          }
